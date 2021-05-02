@@ -14,7 +14,7 @@ use env_logger::Builder;
 use log::info;
 use log::LevelFilter;
 
-use std::time::Duration;
+use std::{io::Read, path::PathBuf, time::Duration};
 use tokio::time::sleep;
 
 // use
@@ -63,9 +63,9 @@ async fn main() {
         .register_type::<SpotifyWrapper>("Spotify?");
 
     // // Structs in steel typically have a constructor that is the name of the struct
-    vm.register_async_fn("playlist->recipe", SpotifyWrapper::create_recipe)
+    vm.register_async_fn("async-playlist->recipe", SpotifyWrapper::create_recipe)
         .register_async_fn(
-            "tracklist->playlist",
+            "async-tracklist->playlist",
             SpotifyWrapper::create_or_update_playlist,
         );
 
@@ -75,8 +75,17 @@ async fn main() {
     vm.register_external_value("*spotify*", SpotifyWrapper::new(spotify))
         .expect("Error registering the spotify client");
 
-    vm.parse_and_execute_from_path("scripts/recipe.rkt")
-        .expect("An error occured running the script");
+    let path = "scripts/recipe.rkt";
+    let path_buf = PathBuf::from(path);
+    let mut file = std::fs::File::open(path).expect("Unable to open the given file");
+    let mut exprs = String::new();
+    file.read_to_string(&mut exprs)
+        .expect("Unable to read from the file");
+    // self.run_with_path(exprs.as_str(), path_buf);
+
+    if let Err(e) = vm.run_with_path(&exprs, path_buf) {
+        e.emit_result("scripts/recipe.rkt", &exprs);
+    }
 
     // // register_fn can be chained
     // vm.register_fn("method-by-value", ExternalStruct::method_by_value)

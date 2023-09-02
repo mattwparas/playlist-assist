@@ -1,154 +1,73 @@
-use futures::channel::oneshot;
-use futures::stream::TryStreamExt;
-use rspotify::model::{
-    idtypes::Track, AudioFeatures, FullTrack, Id, PlayableItem, PlaylistId, PlaylistItem, TrackId,
-};
-use rspotify::{client::Spotify, model::FullPlaylist, scopes};
-use rspotify::{client::SpotifyBuilder, pagination::paginate};
-use rspotify::{
-    model::SimplifiedPlaylist,
-    oauth2::{CredentialsBuilder, OAuthBuilder},
-};
+use playlist::service::{spotify_module, PlaylistCreation};
+use rspotify::prelude::OAuthClient;
+use rspotify::{scopes, AuthCodeSpotify, Credentials, OAuth};
 
 use env_logger::Builder;
-use log::info;
+
 use log::LevelFilter;
-
-use std::{io::Read, path::PathBuf, time::Duration};
-use tokio::time::sleep;
-
-// use
-
-use playlist::service::*;
-use playlist::shuffle::{Recipe, SpotifyTrack};
-
-use std::collections::HashMap;
-
+use steel::rvals::AsRefSteelVal;
 use steel::steel_vm::engine::Engine;
-use steel::steel_vm::register_fn::RegisterAsyncFn;
-use steel::steel_vm::register_fn::RegisterFn;
 
-use playlist::service::{RecipeWrapper, SpotifyWrapper};
-
-#[tokio::main]
-async fn main() {
+fn main() {
     let mut builder = Builder::new();
     builder.filter(Some("playlist"), LevelFilter::Trace).init();
 
-    let creds = CredentialsBuilder::from_env().build().unwrap();
+    let creds = Credentials::from_env().unwrap();
 
-    let oauth = OAuthBuilder::from_env()
-        .scope(scopes!(
-            "playlist-modify-private",
-            "playlist-modify-public",
-            "playlist-read-private"
-        ))
-        .redirect_uri("http://localhost:8080/callback")
-        .build()
-        .unwrap();
+    let mut oauth = OAuth::from_env(scopes!(
+        "playlist-modify-private",
+        "playlist-modify-public",
+        "playlist-read-private",
+        "user-read-currently-playing"
+    ))
+    // .redirect_uri("http://localhost:8080/callback")
+    // .build()
+    .unwrap();
 
-    let mut spotify = SpotifyBuilder::default()
-        .credentials(creds)
-        .oauth(oauth)
-        .build()
-        .unwrap();
+    // Same for RSPOTIFY_REDIRECT_URI. You can also set it explictly:
+    //
+    // ```
+    // let oauth = OAuth {
+    //     redirect_uri: "http://localhost:8888/callback".to_string(),
+    //     scopes: scopes!("user-read-recently-played"),
+    //     ..Default::default(),
+    // };
+    // ```
+    // let mut oauth = OAuth::from_env(scopes!("user-read-currently-playing")).unwrap();
+    oauth.redirect_uri = "http://localhost:8080/callback".to_string();
+
+    let mut spotify = AuthCodeSpotify::new(creds, oauth);
+
+    spotify.config.token_cached = true;
 
     // Obtaining the access token
-    spotify.prompt_for_user_token().await.unwrap();
+    let url = spotify.get_authorize_url(false).unwrap();
+    // This function requires the `cli` feature enabled.
+    spotify.prompt_for_token(&url).unwrap();
 
-    let mut vm = Engine::new();
+    let mut engine = Engine::new();
 
-    // // Registering a type gives access to a predicate for the type
-    vm.register_type::<RecipeWrapper>("Recipe?")
-        .register_type::<SpotifyWrapper>("Spotify?");
+    // Load the spotify module in!
+    engine.register_module(spotify_module());
 
-    // // Structs in steel typically have a constructor that is the name of the struct
-    vm.register_async_fn("async-playlist->recipe", SpotifyWrapper::create_recipe)
-        .register_async_fn(
-            "async-tracklist->playlist",
-            SpotifyWrapper::create_or_update_playlist,
-        );
+    // Include the kernel to load the stuff right away
+    engine.run(include_str!("../kernel/prelude.scm")).unwrap();
 
-    vm.register_fn("register-group", RecipeWrapper::add_group)
-        .register_fn("shuffle", RecipeWrapper::shuffle);
+    let path = std::env::args().collect::<Vec<String>>()[1].clone();
 
-    vm.register_external_value("*spotify*", SpotifyWrapper::new(spotify))
-        .expect("Error registering the spotify client");
+    let expr = std::fs::read_to_string(&path).unwrap();
 
-    let path = "scripts/recipe.rkt";
-    let path_buf = PathBuf::from(path);
-    let mut file = std::fs::File::open(path).expect("Unable to open the given file");
-    let mut exprs = String::new();
-    file.read_to_string(&mut exprs)
-        .expect("Unable to read from the file");
-    // self.run_with_path(exprs.as_str(), path_buf);
+    let values = engine.run(&expr).unwrap();
 
-    if let Err(e) = vm.run_with_path(&exprs, path_buf) {
-        e.emit_result("scripts/recipe.rkt", &exprs);
-    }
+    let mut _nursery = ();
 
-    // // register_fn can be chained
-    // vm.register_fn("method-by-value", ExternalStruct::method_by_value)
-    //     .register_fn("set-foo", ExternalStruct::set_foo);
+    let generated_playlist = PlaylistCreation::as_ref(&values[0], &mut _nursery);
 
-    // let external_struct = ExternalStruct::new(1, "foo".to_string(), 12.4);
+    generated_playlist
+        .as_ref()
+        .unwrap()
+        .build(&spotify)
+        .unwrap();
 
-    // // Registering an external value is fallible if the conversion fails for some reason
-    // // For instance, registering an Err(T) is fallible. However, most implementation outside of manual
-    // // ones should not fail
-    // vm.register_external_value("external-struct", external_struct)
-    //     .unwrap();
-
-    // let playlist = find_user_playlist(&mut spotify, "DM")
-    //     .await
-    //     .expect("Unable to find playlist information for DM");
-
-    // let tracks = get_playlist_tracks(&mut spotify, &playlist).await;
-
-    // let playable_tracks = get_playable_tracks(tracks).await;
-
-    // let object_vec: Vec<_> = playable_tracks
-    //     .iter()
-    //     .map(|x| SpotifyTrack::new(x.id.as_ref().unwrap(), x.name.as_str()))
-    //     .collect();
-
-    // // TODO disambiguate names when they're the same
-    // let mut name_map = HashMap::new();
-    // for track in &object_vec {
-    //     name_map.insert(track.name.clone(), track.track_id.clone());
-    // }
-
-    // let mut recipe = Recipe::new(object_vec, name_map);
-
-    // recipe
-    //     .add_group_by_name(vec!["Blessed By A Nightmare", "Make A Sound"])
-    //     .add_group_by_name(vec![
-    //         "Better Not (feat. Wafia)",
-    //         "Waikiki - Original Mix",
-    //         "Midsummer Madness",
-    //     ]);
-
-    // let playable_tracks = recipe.shuffle();
-
-    // let track_ids: Vec<&TrackId> = playable_tracks
-    //     .iter()
-    //     .map(|x| Id::from_id(&x.track_id).unwrap())
-    //     .collect();
-
-    // // let features = get_features(&mut spotify, track_ids.clone()).await;
-
-    // // if features.len() != playable_tracks.len() {
-    // //     info!("Unable to gather features for all ")
-    // // } else {
-    // //     info!("Successfully gathered features for all tracks");
-    // // }
-
-    // create_or_replace_contents_of_playlist(
-    //     &mut spotify,
-    //     "rust test playlist 2",
-    //     None,
-    //     track_ids.into_iter(),
-    // )
-    // .await
-    // .expect("Couldn't create new playlist");
+    println!("Done!");
 }
